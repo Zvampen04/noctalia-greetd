@@ -1,7 +1,7 @@
 #include "shell/lockscreen/lock_visual_layout.h"
 
 #include "render/core/render_styles.h"
-#include "render/render_context.h"
+#include "render/core/renderer.h"
 #include "render/scene/wallpaper_node.h"
 #include "ui/controls/box.h"
 #include "ui/controls/button.h"

@@ -77,6 +77,29 @@ bool pointerEventPressed(const Event& event) {
   }
 }
 
+template <typename SurfaceType, typename RenderContextType>
+Renderer& layoutRenderer(SurfaceType& surface, RenderContextType& fallback) {
+  if constexpr (requires { surface.renderTarget().renderer(); }) {
+    return surface.renderTarget().renderer();
+  } else {
+    return fallback;
+  }
+}
+
+template <typename Dispatcher, typename Event>
+void dispatchPointerButton(Dispatcher& dispatcher, const Event& event) {
+  const float x = static_cast<float>(event.sx);
+  const float y = static_cast<float>(event.sy);
+  const bool pressed = pointerEventPressed(event);
+  if constexpr (requires {
+                  dispatcher.pointerButton(x, y, event.button, pressed, event.serial, event.time, event.touch);
+                }) {
+    dispatcher.pointerButton(x, y, event.button, pressed, event.serial, event.time, event.touch);
+  } else {
+    dispatcher.pointerButton(x, y, event.button, pressed);
+  }
+}
+
 struct Session {
   std::string id;
   std::string name;
@@ -602,9 +625,7 @@ public:
       m_inputDispatcher.pointerMotion(static_cast<float>(event.sx), static_cast<float>(event.sy), event.serial);
       break;
     case PointerEvent::Type::Button:
-      m_inputDispatcher.pointerButton(
-          static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, pointerEventPressed(event)
-      );
+      dispatchPointerButton(m_inputDispatcher, event);
       break;
     case PointerEvent::Type::Axis:
       if (handleSessionMenuAxisScroll(event.axisValue120, event.axisValue, event.axisDiscrete)) {
@@ -816,7 +837,7 @@ private:
     const float sw = static_cast<float>(width);
     const float sh = static_cast<float>(height);
     const auto visual = lockscreen::layoutLockVisual(lockscreen::LockVisualLayoutParams{
-        .renderer = m_renderContext,
+        .renderer = layoutRenderer(*m_surface, m_renderContext),
         .root = m_root,
         .wallpaper = *m_wallpaper,
         .backdrop = *m_backdrop,
@@ -855,19 +876,19 @@ private:
     m_rootButton->setText(m_rootMode ? "User login" : "Root login");
     m_rootButton->setSize(128.0f, extraButtonH);
     m_rootButton->setPosition(edgeInset, buttonY);
-    m_rootButton->layout(m_renderContext);
+    m_rootButton->layout(layoutRenderer(*m_surface, m_renderContext));
 
     m_profileButton->setText(m_profileButtonText);
     m_profileButton->setEnabled(!m_rootMode);
     m_profileButton->setSize(profileButtonW, extraButtonH);
     m_profileButton->setPosition(profileX, buttonY);
-    m_profileButton->layout(m_renderContext);
+    m_profileButton->layout(layoutRenderer(*m_surface, m_renderContext));
 
     m_sessionButton->setText(m_sessionButtonText);
     m_sessionButton->setEnabled(!m_rootMode);
     m_sessionButton->setSize(sessionButtonW, extraButtonH);
     m_sessionButton->setPosition(sessionX, buttonY);
-    m_sessionButton->layout(m_renderContext);
+    m_sessionButton->layout(layoutRenderer(*m_surface, m_renderContext));
 
     layoutSessionMenu(sessionX, buttonY, sessionButtonW);
     layoutProfileMenu(profileX, buttonY, profileButtonW);
@@ -884,7 +905,7 @@ private:
     }
     m_statusLabel->setText(m_statusText);
     m_statusLabel->setMaxWidth(std::max(120.0f, visual.panelWidth - Style::spaceLg * 2.0f));
-    m_statusLabel->layout(m_renderContext);
+    m_statusLabel->layout(layoutRenderer(*m_surface, m_renderContext));
     const float labelX = visual.panelX + std::round((visual.panelWidth - m_statusLabel->width()) * 0.5f);
     const float labelY = visual.panelY - m_statusLabel->height() - Style::spaceSm;
     m_statusLabel->setPosition(labelX, labelY);
@@ -951,7 +972,7 @@ private:
       const std::size_t localIndex = i - m_sessionScrollOffset;
       item->setSize(menuWidth - menuPad * 2.0f, itemHeight);
       item->setPosition(menuX + menuPad, menuY + menuPad + static_cast<float>(localIndex) * (itemHeight + menuGap));
-      item->layout(m_renderContext);
+      item->layout(layoutRenderer(*m_surface, m_renderContext));
     }
   }
 
@@ -1048,7 +1069,7 @@ private:
       item->setVisible(m_profileMenuOpen && !m_rootMode);
       item->setSize(menuWidth - menuPad * 2.0f, itemHeight);
       item->setPosition(menuX + menuPad, menuY + menuPad + static_cast<float>(i) * (itemHeight + menuGap));
-      item->layout(m_renderContext);
+      item->layout(layoutRenderer(*m_surface, m_renderContext));
     }
   }
 

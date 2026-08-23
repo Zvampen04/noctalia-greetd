@@ -40,9 +40,15 @@ noctaliaPackage.overrideAttrs (oldAttrs: {
       --replace-fail "executable('noctalia'," "executable('noctalia-greetd',"
   '';
 
-  postFixup = builtins.replaceStrings [ "$out/bin/noctalia" ] [ "$out/bin/noctalia-greetd" ] (
-    oldAttrs.postFixup or ""
-  );
+  postFixup =
+    let
+      renamedPostFixup = builtins.replaceStrings [ "$out/bin/noctalia" ] [ "$out/bin/noctalia-greetd" ] (
+        oldAttrs.postFixup or ""
+      );
+    in
+    lib.concatStringsSep "\n" (
+      lib.filter (line: !(lib.hasInfix " completions " line)) (lib.splitString "\n" renamedPostFixup)
+    );
 
   patches = (oldAttrs.patches or [ ]) ++ [
     ../patches/lockscreen-shared-visual-layout.patch

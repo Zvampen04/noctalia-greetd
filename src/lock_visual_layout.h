@@ -10,13 +10,13 @@ class Button;
 class Input;
 class Label;
 class Node;
-class RenderContext;
+class Renderer;
 class WallpaperNode;
 
 namespace lockscreen {
 
 struct LockVisualLayoutParams {
-  RenderContext& renderer;
+  Renderer& renderer;
   Node& root;
   Box* backgroundLayer = nullptr;
   WallpaperNode& wallpaper;
