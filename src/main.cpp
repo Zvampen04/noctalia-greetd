@@ -1,4 +1,15 @@
 #include "auth/pam_authenticator.h"
+#include "appearance.h"
+#include "lock_widgets_scene.h"
+#include "lock_widget_services.h"
+#include "render/animation/animation_manager.h"
+#include "shell/desktop/desktop_widget_layout.h"
+#include "session_lock_surface.h"
+#include "on_screen_keyboard.h"
+#include "desktop_keyboard.h"
+#include "controller_pointer.h"
+#include "session_lock_hint.h"
+#include <sys/resource.h>
 #if __has_include("core/input/key_symbols.h")
 #include "core/input/key_symbols.h"
 #else
@@ -6,6 +17,7 @@
 #endif
 #include "core/timer_manager.h"
 #include "render/core/color.h"
+#include "render/animation/motion_service.h"
 #include "render/core/blur_cache.h"
 #include "render/core/render_styles.h"
 #include "render/core/shared_texture_cache.h"
@@ -113,6 +125,8 @@ struct Profile {
 };
 
 struct ProgramOptions {
+  bool lock = false;
+  bool keyboard = false;
   bool kscreenlocker = false;
   bool immediateLock = false;
   bool noLock = false;
@@ -164,7 +178,11 @@ ProgramOptions parseOptions(int argc, char** argv) {
   ProgramOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg(argv[i] != nullptr ? argv[i] : "");
-    if (arg == "--kscreenlocker") {
+    if (arg == "--lock") {
+      options.lock = true;
+    } else if (arg == "--keyboard") {
+      options.keyboard = true;
+    } else if (arg == "--kscreenlocker") {
       options.kscreenlocker = true;
     } else if (arg == "--immediateLock") {
       options.immediateLock = true;
@@ -184,6 +202,10 @@ ProgramOptions parseOptions(int argc, char** argv) {
       throw std::runtime_error(std::format("unknown option: {}", arg));
     }
   }
+  if (options.lock && (options.kscreenlocker || options.noLock))
+    throw std::runtime_error("--lock cannot be combined with KScreenLocker or --nolock");
+  if (options.keyboard && (options.lock || options.kscreenlocker))
+    throw std::runtime_error("--keyboard cannot be combined with a lock mode");
   return options;
 }
 
@@ -522,9 +544,11 @@ public:
   NativeGreeter(
       WaylandConnection& wayland, RenderContext& renderContext, SharedTextureCache& textureCache,
       std::vector<Profile> profiles, std::string wallpaper, std::vector<Session> sessions,
-      std::vector<std::string> rootCommand, ProgramOptions options, KScreenLockerBridge* kscreenlockerBridge
+      std::vector<std::string> rootCommand, ProgramOptions options, KScreenLockerBridge* kscreenlockerBridge,
+      LockWidgetServices& widgetServices
   )
       : m_wayland(wayland),
+        m_widgetServices(widgetServices),
         m_renderContext(renderContext),
         m_textureCache(textureCache),
         m_profiles(std::move(profiles)),
@@ -533,36 +557,89 @@ public:
         m_rootCommand(std::move(rootCommand)),
         m_options(options),
         m_kscreenlockerBridge(kscreenlockerBridge) {
-    applyPaletteFromFile(envOr("LOCKSCREEN_GREETER_PALETTE"));
     Input::setValidateKeyMatcher([](std::uint32_t sym, std::uint32_t) { return KeySymbol::isEnter(sym); });
+    m_root.setAnimationManager(&m_animations);
     buildScene();
   }
 
-  bool initialize() {
-    wl_output* output = nullptr;
-    std::uint32_t defaultWidth = 1920;
-    std::uint32_t defaultHeight = 1080;
-    if (!m_wayland.outputs().empty()) {
-      const auto& firstOutput = m_wayland.outputs().front();
-      output = firstOutput.output;
-      if (firstOutput.logicalWidth > 0) {
-        defaultWidth = static_cast<std::uint32_t>(firstOutput.logicalWidth);
-      }
-      if (firstOutput.logicalHeight > 0) {
-        defaultHeight = static_cast<std::uint32_t>(firstOutput.logicalHeight);
-      }
-    }
+  ~NativeGreeter() { secureClear(m_password); }
 
-    if (m_wayland.hasLayerShell() && !envBool("LOCKSCREEN_GREETER_FORCE_TOPLEVEL", false)) {
+  void setAuthTarget(NativeGreeter* target) { m_authTarget = target; m_keyboard->setFullDisplay(target != nullptr); }
+  std::function<void(uint32_t,uint32_t)> onDesktopKey;
+  void setAuthenticationAllowed(bool allowed) { m_authenticationAllowed = allowed; }
+  wl_output* output() const { return m_output; }
+  bool ownsSurface(wl_surface* surface) const { return m_surface && m_surface->wlSurface() == surface; }
+  OnScreenKeyboard& keyboard() { return *m_keyboard; }
+  void detach() {
+    // Drop service listeners before the last output surface disappears.
+    m_lockWidgets.reset();
+    m_surface.reset();
+    m_output = nullptr;
+  }
+  void refresh() { if (m_surface) m_surface->requestUpdate(); }
+  bool needsWidgetFrame() const {
+    return m_surface && !m_options.keyboard && (m_animations.hasActive() || (m_lockWidgets && m_lockWidgets->needsFrameTick()));
+  }
+  void widgetFrame(float deltaMs) {
+    if (!m_surface || !needsWidgetFrame()) return;
+    m_renderContext.makeCurrent(m_surface->renderTarget());
+    m_animations.tick(deltaMs);
+    if (m_lockWidgets) m_lockWidgets->frameTick(deltaMs, layoutRenderer(*m_surface, m_renderContext));
+    requestForDirtyScene();
+  }
+  void setWidgetAppearance(const greeter_appearance::LockWidgetLayout& layout) {
+    m_widgetAppearance = layout;
+    if (m_surface) m_surface->requestLayout();
+  }
+  void refreshAppearance() {
+    // Restyle retained controls; do not replace inputs, focus, authentication or surfaces.
+    const auto visit = [&](auto&& self, Node& node) -> void {
+      if (auto* button = dynamic_cast<Button*>(&node)) {
+        button->setFontSize(Style::fontSizeBody);
+        button->setRadius(Style::scaledRadiusMd());
+      } else if (auto* input = dynamic_cast<Input*>(&node)) {
+        input->setFontSize(Style::fontSizeBody);
+        input->setControlHeight(Style::controlHeight);
+        input->setHorizontalPadding(Style::spaceSm);
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+        input->setFrameRadius(Style::scaledRadiusMd());
+#endif
+      }
+      node.markLayoutDirty();
+      node.markPaintDirty();
+      for (const auto& child : node.children()) self(self, *child);
+    };
+    visit(visit, m_root);
+    if (m_statusLabel) m_statusLabel->setFontSize(Style::fontSizeCaption);
+    if (m_keyboard) m_keyboard->refreshAppearance();
+    if (m_surface) m_surface->requestLayout();
+  }
+  void refreshOutputScale() {
+    if (auto* lockSurface = dynamic_cast<SessionLockSurface*>(m_surface.get()))
+      if (const auto* info = m_wayland.findOutputByWl(m_output)) lockSurface->refreshOutputScale(*info);
+  }
+
+  bool initialize(const WaylandOutput& info, ext_session_lock_v1* lock = nullptr) {
+    detach();
+    wl_output* output = info.output;
+    m_output = output;
+    const auto defaultWidth = static_cast<uint32_t>(info.effectiveLogicalWidth());
+    const auto defaultHeight = static_cast<uint32_t>(info.effectiveLogicalHeight());
+    if (lock) {
+      m_surface = std::make_unique<SessionLockSurface>(m_wayland);
+      m_initializeSurface = [this, lock, info]() {
+        return static_cast<SessionLockSurface*>(m_surface.get())->initialize(lock, info);
+      };
+    } else if (m_wayland.hasLayerShell() && !envBool("LOCKSCREEN_GREETER_FORCE_TOPLEVEL", false)) {
       LayerSurfaceConfig config{
-          .nameSpace = "noctalia-greetd",
+          .nameSpace = m_options.keyboard ? "noctalia-desktop-keyboard" : "noctalia-greetd",
           .layer = LayerShellLayer::Overlay,
           .anchor =
-              LayerShellAnchor::Top | LayerShellAnchor::Bottom | LayerShellAnchor::Left | LayerShellAnchor::Right,
+              (m_options.keyboard ? LayerShellAnchor::Bottom : LayerShellAnchor::Top | LayerShellAnchor::Bottom) | LayerShellAnchor::Left | LayerShellAnchor::Right,
           .width = 0,
-          .height = 0,
-          .exclusiveZone = -1,
-          .keyboard = LayerShellKeyboard::Exclusive,
+          .height = m_options.keyboard ? std::min(defaultHeight, 400U) : 0,
+          .exclusiveZone = m_options.keyboard ? static_cast<int>(std::min(defaultHeight, 400U)) : -1,
+          .keyboard = m_options.keyboard ? LayerShellKeyboard::None : LayerShellKeyboard::Exclusive,
           .defaultWidth = defaultWidth,
           .defaultHeight = defaultHeight,
       };
@@ -570,6 +647,7 @@ public:
       m_surface = std::move(layerSurface);
       m_initializeSurface = [this, output]() { return static_cast<LayerSurface*>(m_surface.get())->initialize(output); };
     } else {
+      if (m_options.keyboard) throw std::runtime_error("On Screen Keyboard requires layer-shell");
       auto topLevelSurface = std::make_unique<ToplevelSurface>(m_wayland);
       m_surface = std::move(topLevelSurface);
       ToplevelSurfaceConfig config{
@@ -585,6 +663,10 @@ public:
       };
     }
 
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+    // Login/lock must never publish or request a compositor backdrop.
+    m_surface->setExternalMaterialAllowed(m_options.keyboard);
+#endif
     m_surface->setRenderContext(&m_renderContext);
     m_surface->setSceneRoot(&m_root);
     m_surface->setConfigureCallback([this](std::uint32_t, std::uint32_t) { m_surface->requestLayout(); });
@@ -595,7 +677,8 @@ public:
     if (!m_initializeSurface || !m_initializeSurface()) {
       return false;
     }
-    m_inputDispatcher.setTextInputContext(m_surface->wlSurface(), m_wayland.textInputService(), true);
+    if (!m_options.lock && !m_options.keyboard)
+      m_inputDispatcher.setTextInputContext(m_surface->wlSurface(), m_wayland.textInputService(), true);
     focusPasswordField();
     m_surface->requestUpdate();
     if (m_kscreenlockerBridge != nullptr) {
@@ -609,6 +692,9 @@ public:
       return;
     }
 
+    if (event.type == PointerEvent::Type::Motion ||
+        (event.type == PointerEvent::Type::Button && pointerEventPressed(event)))
+      m_keyboard->clearSelection();
     if (!m_loggedPointerEvent) {
       std::cerr << "noctalia-greetd: pointer input received\n";
       m_loggedPointerEvent = true;
@@ -641,13 +727,6 @@ public:
   }
 
   void handleKeyboardEvent(const KeyboardEvent& event) {
-    if (m_surface != nullptr) {
-      wl_surface* focusedSurface = m_wayland.lastKeyboardSurface();
-      if (focusedSurface != nullptr && focusedSurface != m_surface->wlSurface()) {
-        return;
-      }
-    }
-
     if (!m_loggedKeyboardEvent && event.pressed) {
       std::cerr << "noctalia-greetd: keyboard input received\n";
       m_loggedKeyboardEvent = true;
@@ -683,6 +762,20 @@ private:
   }
 
   void buildScene() {
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+    m_root.setMaterialSurface(m_options.keyboard ? "osk" : (m_options.lock || m_options.kscreenlocker) ? "lock" : "greeter");
+#endif
+    if (m_options.keyboard) {
+      m_keyboard = std::make_unique<OnScreenKeyboard>(m_root,
+        [this](uint32_t symbol, uint32_t unicode) { if (onDesktopKey) onDesktopKey(symbol,unicode); },
+        [this] { if (m_keyboard && !m_keyboard->visible()) m_done = true; if (m_surface) m_surface->requestLayout(); });
+      m_keyboard->setDesktopMaterial(true);
+      m_keyboard->setFullDisplay(true);
+      m_keyboard->setVisible(true);
+      m_inputDispatcher.setSceneRoot(&m_root);
+      m_inputDispatcher.setCursorShapeCallback([this](uint32_t serial, uint32_t shape) { m_wayland.setCursorShape(serial,shape); });
+      return;
+    }
     auto wallpaper = std::make_unique<WallpaperNode>();
     m_wallpaper = static_cast<WallpaperNode*>(m_root.addChild(std::move(wallpaper)));
     m_wallpaper->setZIndex(0);
@@ -698,13 +791,16 @@ private:
         .configure = [](Box& box) { box.setZIndex(-1); },
     }));
 
-    m_root.addChild(ui::label({.out = &m_clockShadow}));
     m_root.addChild(ui::label({
         .out = &m_clock,
         .color = colorSpecFromRole(ColorRole::Primary),
     }));
 
     m_root.addChild(ui::box({.out = &m_loginPanel}));
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+    m_loginPanel->setMaterialIdentity("surface", "panel");
+    m_loginPanel->setMaterialBackdrop(MaterialBackdrop::Local);
+#endif
     m_root.addChild(ui::box({
         .out = &m_passwordFocusRing,
         .visible = false,
@@ -761,6 +857,10 @@ private:
         .visible = false,
         .configure = [](Box& box) { box.setZIndex(30); },
     }));
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+    m_profileMenu->setMaterialIdentity("surface", "panel");
+    m_profileMenu->setMaterialBackdrop(MaterialBackdrop::Local);
+#endif
     for (std::size_t i = 0; i < m_profiles.size(); ++i) {
       Button* item = nullptr;
       m_root.addChild(ui::button({
@@ -794,6 +894,10 @@ private:
         .visible = false,
         .configure = [](Box& box) { box.setZIndex(20); },
     }));
+#ifdef NOCTALIA_GREETER_FULL_APPEARANCE
+    m_sessionMenu->setMaterialIdentity("surface", "panel");
+    m_sessionMenu->setMaterialBackdrop(MaterialBackdrop::Local);
+#endif
     for (std::size_t i = 0; i < m_sessions.size(); ++i) {
       Button* item = nullptr;
       m_root.addChild(ui::button({
@@ -808,6 +912,15 @@ private:
       m_sessionItems.push_back(item);
     }
 
+    m_keyboard = std::make_unique<OnScreenKeyboard>(m_root,
+      [this](uint32_t sym, uint32_t unicode) {
+        auto& target = m_authTarget ? *m_authTarget : *this;
+        if (target.m_authBusy) return;
+        target.focusPasswordField();
+        target.m_inputDispatcher.keyEvent(sym, unicode, 0, true, false);
+        target.m_inputDispatcher.keyEvent(sym, unicode, 0, false, false);
+        target.requestForDirtyScene();
+      }, [this] { refresh(); });
     m_inputDispatcher.setSceneRoot(&m_root);
     m_inputDispatcher.setCursorShapeCallback([this](std::uint32_t serial, std::uint32_t shape) {
       m_wayland.setCursorShape(serial, shape);
@@ -832,49 +945,107 @@ private:
   }
 
   void layoutScene(std::uint32_t width, std::uint32_t height) {
+    if (m_options.keyboard) {
+      m_root.setSize(width,height);
+      m_keyboard->layout(layoutRenderer(*m_surface, m_renderContext),width,height);
+#if defined(NOCTALIA_HAS_SURFACE_MATERIALS) && !defined(NOCTALIA_GREETER_FULL_APPEARANCE)
+      // Only the desktop keyboard samples a compositor backdrop. Login and
+      // locking keep their own wallpaper scene and never sample the session.
+      if (m_keyboard->visible() && Style::surfaceMaterial() == Style::SurfaceMaterialMode::LiquidGlass) {
+        const auto box = m_keyboard->panelRect();
+        m_surface->setBlurRegion(Surface::tessellateRoundedRect(
+            static_cast<int>(box.x), static_cast<int>(box.y),
+            static_cast<int>(box.width), static_cast<int>(box.height), Style::scaledRadius(18.0F)));
+      } else {
+        m_surface->clearBlurRegion();
+      }
+#endif
+      return;
+    }
     applyWallpaperTexture();
+    // The shared image cache can change the current EGL context while loading.
+    m_renderContext.makeCurrent(m_surface->renderTarget());
 
     const float sw = static_cast<float>(width);
-    const float sh = static_cast<float>(height);
+    const float sh = static_cast<float>(height) - m_keyboard->reservation(height);
+    const auto* outputInfo = m_wayland.findOutputByWl(m_output);
+    const std::string widgetOutput = outputInfo ? desktop_widgets::outputKey(*outputInfo) : std::string{};
+    std::optional<lockscreen::LoginPanelPlacement> loginPlacement;
+    for (const auto& widget : m_widgetAppearance.widgets) {
+      if (widget.type != "login_box" || !widget.enabled
+          || (widget.output.empty() ? m_authTarget != nullptr : widget.output != widgetOutput)) continue;
+      loginPlacement = lockscreen::loginPanelPlacement(widget,sw,static_cast<float>(height));
+      break;
+    }
     const auto visual = lockscreen::layoutLockVisual(lockscreen::LockVisualLayoutParams{
         .renderer = layoutRenderer(*m_surface, m_renderContext),
         .root = m_root,
         .wallpaper = *m_wallpaper,
         .backdrop = *m_backdrop,
         .tintOverlay = m_tintOverlay,
-        .clockShadow = *m_clockShadow,
         .clock = *m_clock,
         .loginPanel = *m_loginPanel,
         .passwordField = *m_passwordField,
         .loginButton = *m_loginButton,
         .width = width,
         .height = height,
+        .bottomReservation = m_keyboard->reservation(height),
         .wallpaperFillMode = m_wallpaperFillMode,
         .wallpaperFillColor = m_wallpaperFillColor,
         .tintIntensity = m_wallpaperTintIntensity,
         .clockShadowEnabled = m_clockShadowEnabled,
+        .loginPlacement = loginPlacement,
     });
 
+    // Decorations can never cover the retained authentication controls.
+    m_loginPanel->setZIndex(5);
+    m_passwordField->setZIndex(6);
+    m_loginButton->setZIndex(6);
+    m_statusLabel->setZIndex(6);
+    if (!m_lockWidgets) m_lockWidgets = std::make_unique<LockWidgetsScene>(
+        m_root, m_widgetServices.runtime(), LockWidgetsScene::Callbacks{
+          .update = [this] { refresh(); },
+          .layout = [this] { if (m_surface) m_surface->requestLayout(); },
+          .redraw = [this] { if (m_surface) m_surface->requestRedraw(); },
+          // The main loop observes needsFrameTick after service/timer dispatch.
+          // A scheduling request alone must not repaint every output.
+          .frame = [] {},
+        }, &m_animations);
+    m_lockWidgets->setServices(m_widgetServices.runtime());
+    m_lockWidgets->sync(m_widgetAppearance, widgetOutput, !m_authTarget,
+        layoutRenderer(*m_surface,m_renderContext), sw, static_cast<float>(height));
+    m_clock->setVisible(!m_lockWidgets->hasClock());
+
+    m_keyboard->layout(layoutRenderer(*m_surface, m_renderContext), sw, height);
+    if (m_authTarget) {
+      hideGreeterControls();
+      m_loginPanel->setVisible(false);
+      m_passwordField->setVisible(false);
+      m_loginButton->setVisible(false);
+      m_passwordFocusRing->setVisible(false);
+      m_statusLabel->setVisible(false);
+      return;
+    }
     layoutPasswordFocusRing();
     layoutStatusLabel(visual);
 
-    if (m_options.kscreenlocker) {
+    if (m_options.kscreenlocker || m_options.lock) {
       hideGreeterControls();
       return;
     }
 
-    const float extraButtonH = 42.0f;
+    const float extraButtonH = Style::controlHeight + Style::spaceXs;
     const float extraBottom = 32.0f;
     const float edgeInset = 32.0f;
     const float buttonGap = 8.0f;
-    const float sessionButtonW = 220.0f;
-    const float profileButtonW = 220.0f;
+    const float sessionButtonW = std::min(220.0f, (sw - 80.0f) / 3.0f);
+    const float profileButtonW = sessionButtonW;
     const float buttonY = sh - extraBottom - extraButtonH;
     const float profileX = sw - edgeInset - profileButtonW;
     const float sessionX = profileX - buttonGap - sessionButtonW;
 
     m_rootButton->setText(m_rootMode ? "User login" : "Root login");
-    m_rootButton->setSize(128.0f, extraButtonH);
+    m_rootButton->setSize(std::min(128.0f, profileButtonW), extraButtonH);
     m_rootButton->setPosition(edgeInset, buttonY);
     m_rootButton->layout(layoutRenderer(*m_surface, m_renderContext));
 
@@ -953,12 +1124,12 @@ private:
     m_sessionMenu->setPosition(menuX, menuY);
     m_sessionMenu->setSize(menuWidth, menuHeight);
     m_sessionMenu->setStyle(RoundedRectStyle{
-        .fill = colorForRole(ColorRole::SurfaceVariant, 0.96f),
+        .fill = colorForRole(ColorRole::Surface),
         .border = colorForRole(ColorRole::Outline, 0.95f),
         .fillMode = FillMode::Solid,
         .radius = Style::scaledRadiusXl(),
         .softness = 1.0f,
-        .borderWidth = Style::borderWidth,
+        .borderWidth = Style::popupBordersEnabled() ? Style::borderWidth : 0.0F,
     });
 
     for (std::size_t i = 0; i < m_sessionItems.size(); ++i) {
@@ -1056,12 +1227,12 @@ private:
     m_profileMenu->setPosition(menuX, menuY);
     m_profileMenu->setSize(menuWidth, menuHeight);
     m_profileMenu->setStyle(RoundedRectStyle{
-        .fill = colorForRole(ColorRole::SurfaceVariant, 0.96f),
+        .fill = colorForRole(ColorRole::Surface),
         .border = colorForRole(ColorRole::Outline, 0.95f),
         .fillMode = FillMode::Solid,
         .radius = Style::scaledRadiusXl(),
         .softness = 1.0f,
-        .borderWidth = Style::borderWidth,
+        .borderWidth = Style::popupBordersEnabled() ? Style::borderWidth : 0.0F,
     });
 
     for (std::size_t i = 0; i < m_profileItems.size(); ++i) {
@@ -1103,7 +1274,7 @@ private:
     }
 
     Color color = rgba(0.0f, 0.0f, 0.0f, 1.0f);
-    if (parseColorWallpaperPath(m_wallpaperPath, color)) {
+    if (m_wallpaperPath.empty() || parseColorWallpaperPath(m_wallpaperPath, color)) {
       m_wallpaper->setSources(
           WallpaperSourceKind::Color, {}, color, WallpaperSourceKind::Image, {}, rgba(0.0f, 0.0f, 0.0f, 1.0f), 0.0f,
           0.0f, 0.0f, 0.0f
@@ -1264,7 +1435,7 @@ private:
       return;
     }
 
-    if (m_options.kscreenlocker) {
+    if (m_options.kscreenlocker || m_options.lock) {
       unlockCurrentSession();
       return;
     }
@@ -1272,15 +1443,18 @@ private:
     const std::string username = m_rootMode ? "root" : selectedProfile().username;
     const std::vector<std::string> command = m_rootMode ? m_rootCommand : selectedSession().command;
     const std::string desktop = m_rootMode ? "root" : selectedSession().desktop;
-    const std::string password = m_password;
+    std::string password = m_password;
+    secureClear(m_password);
 
     setBusy(true);
     setStatus("");
     try {
       authenticate(username, password, command, desktop);
+      secureClear(password);
       m_done = true;
     } catch (const std::exception& error) {
-      m_password.clear();
+      secureClear(password);
+      secureClear(m_password);
       setBusy(false);
       setStatus(error.what()[0] == '\0' ? "Try again" : error.what());
       focusPasswordField();
@@ -1326,7 +1500,7 @@ private:
   }
 
   void unlockCurrentSession() {
-    if (m_authBusy || m_password.empty()) {
+    if (!m_authenticationAllowed || m_authBusy || m_password.empty()) {
       return;
     }
 
@@ -1336,7 +1510,7 @@ private:
     setStatus("Authenticating");
     try {
       const PamAuthenticator authenticator;
-      auto result = authenticator.authenticateCurrentUser(password, "login");
+      auto result = authenticator.authenticateCurrentUser(password, m_options.lock ? "noctalia-greetd" : "login");
       secureClear(password);
       if (result.success) {
         setStatus("Unlocked");
@@ -1361,15 +1535,22 @@ public:
 
 private:
   WaylandConnection& m_wayland;
+  LockWidgetServices& m_widgetServices;
   RenderContext& m_renderContext;
   SharedTextureCache& m_textureCache;
   std::unique_ptr<Surface> m_surface;
+  std::unique_ptr<OnScreenKeyboard> m_keyboard;
+  NativeGreeter* m_authTarget = nullptr;
+  wl_output* m_output = nullptr;
+  bool m_authenticationAllowed = true;
   std::function<bool()> m_initializeSurface;
+  AnimationManager m_animations;
   Node m_root;
+  greeter_appearance::LockWidgetLayout m_widgetAppearance;
+  std::unique_ptr<LockWidgetsScene> m_lockWidgets;
   WallpaperNode* m_wallpaper = nullptr;
   Box* m_tintOverlay = nullptr;
   Box* m_backdrop = nullptr;
-  Label* m_clockShadow = nullptr;
   Label* m_clock = nullptr;
   Box* m_loginPanel = nullptr;
   Box* m_passwordFocusRing = nullptr;
@@ -1390,7 +1571,7 @@ private:
   TextureHandle m_blurredWallpaperTexture{};
   BlurCache m_wallpaperBlurCache;
   WallpaperFillMode m_wallpaperFillMode = WallpaperFillMode::Crop;
-  Color m_wallpaperFillColor = rgba(0.0f, 0.0f, 0.0f, 0.0f);
+  Color m_wallpaperFillColor = rgba(0.0f, 0.0f, 0.0f, 1.0f);
   float m_wallpaperBlurIntensity = envFloat("LOCKSCREEN_GREETER_WALLPAPER_BLUR_INTENSITY", 0.0f);
   float m_wallpaperTintIntensity = envFloat("LOCKSCREEN_GREETER_WALLPAPER_TINT_INTENSITY", 0.0f);
   std::vector<Profile> m_profiles;
@@ -1416,8 +1597,8 @@ private:
   bool m_loggedKeyboardEvent = false;
 };
 
-void runLoop(WaylandConnection& wayland, NativeGreeter& greeter) {
-  while (greeter.running() && !greeter.done()) {
+void runLoop(WaylandConnection& wayland, NativeGreeter& greeter, const std::function<bool()>& tick, const std::function<int()>& pollTimeout, int wakeFd = -1, int appearanceFd = -1, LockWidgetServices* widgetServices = nullptr) {
+  while (!greeter.done() && tick()) {
     Surface::drainPendingFrameWork();
     Surface::drainPendingRenders();
 
@@ -1441,15 +1622,19 @@ void runLoop(WaylandConnection& wayland, NativeGreeter& greeter) {
       events |= POLLOUT;
     }
 
-    pollfd fd{.fd = wl_display_get_fd(wayland.display()), .events = events, .revents = 0};
-    int timeout = Surface::hasPendingFrameWork() || Surface::hasPendingRenders() ? 0 : 1000;
+    pollfd fds[4]{{.fd = wl_display_get_fd(wayland.display()), .events = events, .revents = 0},
+                  {.fd = wakeFd, .events = POLLIN, .revents = 0},
+                  {.fd = appearanceFd, .events = POLLIN, .revents = 0},
+                  {.fd = widgetServices ? widgetServices->fd() : -1, .events = POLLIN, .revents = 0}};
+    auto& fd = fds[0];
+    int timeout = Surface::hasPendingFrameWork() || Surface::hasPendingRenders() ? 0 : pollTimeout();
     if (const int repeatTimeout = wayland.repeatPollTimeoutMs(); repeatTimeout >= 0) {
       timeout = std::min(timeout, repeatTimeout);
     }
     if (const int timerTimeout = TimerManager::instance().pollTimeoutMs(); timerTimeout >= 0) {
       timeout = std::min(timeout, timerTimeout);
     }
-    const int pollRet = ::poll(&fd, 1, timeout);
+    const int pollRet = ::poll(fds, 4, timeout);
     if (pollRet < 0 && errno != EINTR) {
       wl_display_cancel_read(wayland.display());
       throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
@@ -1465,6 +1650,7 @@ void runLoop(WaylandConnection& wayland, NativeGreeter& greeter) {
     if (wl_display_dispatch_pending(wayland.display()) < 0) {
       throw std::runtime_error(wayland.describeDisplayError(errno));
     }
+    if (widgetServices && (fds[3].revents & POLLIN)) widgetServices->dispatch();
     TimerManager::instance().tick();
     wayland.repeatTick();
   }
@@ -1476,12 +1662,16 @@ int main(int argc, char** argv) {
   std::setlocale(LC_ALL, "");
   std::setlocale(LC_NUMERIC, "C");
 
+  applyPaletteFromFile(envOr("LOCKSCREEN_GREETER_PALETTE"));
+  greeter_appearance::Monitor appearance;
+  std::string appearanceError;
+
   const ProgramOptions options = parseOptions(argc, argv);
-  auto sessions = options.kscreenlocker ? std::vector<Session>{} : parseSessions();
-  if (!options.kscreenlocker && sessions.empty()) {
+  auto sessions = (options.keyboard || options.kscreenlocker || options.lock) ? std::vector<Session>{} : parseSessions();
+  if (!options.keyboard && !options.kscreenlocker && !options.lock && sessions.empty()) {
     throw std::runtime_error("No sessions configured");
   }
-  auto profiles = options.kscreenlocker ? currentUserProfile() : parseProfiles();
+  auto profiles = (options.keyboard || options.kscreenlocker || options.lock) ? currentUserProfile() : parseProfiles();
   if (profiles.empty()) {
     throw std::runtime_error("No user profiles configured");
   }
@@ -1502,23 +1692,197 @@ int main(int argc, char** argv) {
   textureCache.initialize(&glShared);
   RenderContext renderContext;
   renderContext.initialize(glShared);
+  renderContext.setTextFontFamily(appearance.value().font);
 
-  NativeGreeter greeter(
-      wayland, renderContext, textureCache, std::move(profiles), envOr("LOCKSCREEN_GREETER_WALLPAPER"),
-      std::move(sessions), parseRootCommand(), options, options.kscreenlocker ? &kscreenlockerBridge : nullptr
-  );
-  wayland.setPointerEventCallback([&greeter](const PointerEvent& event) { greeter.handlePointerEvent(event); });
-  wayland.setKeyboardEventCallback([&greeter](const KeyboardEvent& event) { greeter.handleKeyboardEvent(event); });
-
-  if (!greeter.initialize()) {
-    throw std::runtime_error("failed to initialize native greeter surface");
+  // Disable core dumps before any authentication material enters this process.
+  const rlimit coreLimit{0, 0};
+  setrlimit(RLIMIT_CORE, &coreLimit);
+  bool locked = false, finished = false;
+  SessionLockHint lockHint;
+  ext_session_lock_v1* sessionLock = nullptr;
+  std::pair<bool*, bool*> lockState{&locked, &finished};
+  if (options.lock) {
+    if (!wayland.hasSessionLockManager())
+      throw std::runtime_error("session lock protocol unavailable");
+    sessionLock = ext_session_lock_manager_v1_lock(wayland.sessionLockManager());
+    static const ext_session_lock_v1_listener listener{
+      .locked = [](void* data, ext_session_lock_v1*) {
+        *static_cast<std::pair<bool*, bool*>*>(data)->first = true;
+      },
+      .finished = [](void* data, ext_session_lock_v1*) {
+        *static_cast<std::pair<bool*, bool*>*>(data)->second = true;
+      },
+    };
+    ext_session_lock_v1_add_listener(sessionLock, &listener, &lockState);
   }
 
-  std::cerr << "noctalia-greetd: native greeter initialized\n";
-  if (options.kscreenlocker) {
-    std::cout << "Locked at " << std::time(nullptr) << std::endl;
+  LockWidgetServices widgetServices;
+  if (!options.keyboard) widgetServices.prepare(appearance.value().lockWidgets);
+  NativeGreeter greeter(wayland, renderContext, textureCache, profiles,
+      envOr("LOCKSCREEN_GREETER_WALLPAPER"), sessions, parseRootCommand(), options,
+      options.kscreenlocker ? &kscreenlockerBridge : nullptr, widgetServices);
+  greeter.setWidgetAppearance(appearance.value().lockWidgets);
+  greeter.setAuthenticationAllowed(!options.lock);
+  std::vector<std::unique_ptr<NativeGreeter>> companions;
+  widgetServices.changed = [&] {
+    greeter.refresh();
+    for (auto& view : companions) view->refresh();
+  };
+  bool outputsChanged = true;
+  wayland.setOutputChangeCallback([&] { outputsChanged = true; });
+  wayland.setPointerEventCallback([&](const PointerEvent& event) {
+    if (event.type == PointerEvent::Type::Motion ||
+        (event.type == PointerEvent::Type::Button && pointerEventPressed(event))) {
+      greeter.keyboard().clearSelection();
+      for (auto& view : companions) view->keyboard().clearSelection();
+    }
+    greeter.handlePointerEvent(event);
+    for (auto& view : companions) view->handlePointerEvent(event);
+  });
+  wayland.setKeyboardEventCallback([&](const KeyboardEvent& event) { greeter.handleKeyboardEvent(event); });
+  ControllerPointer controllers(wayland);
+  std::unique_ptr<DesktopKeyboard> desktopKeyboard;
+  if (options.keyboard) {
+    desktopKeyboard = std::make_unique<DesktopKeyboard>(wayland);
+    greeter.onDesktopKey = [&](uint32_t symbol, uint32_t unicode) { desktopKeyboard->send(symbol,unicode); };
   }
-  runLoop(wayland, greeter);
-  std::cerr << "noctalia-greetd: native greeter exiting\n";
-  return 0;
+  controllers.onNavigate = [&](int dx, int dy) {
+    std::vector<NativeGreeter*> views{&greeter};
+    for (auto& view : companions) views.push_back(view.get());
+    NativeGreeter* target = nullptr;
+    for (auto* view : views) if (view->keyboard().hasSelection()) { target = view; break; }
+    if (!target) for (auto* view : views)
+      if (view->keyboard().visible() && view->ownsSurface(wayland.lastPointerSurface())) { target = view; break; }
+    if (!target) for (auto* view : views) if (view->keyboard().visible()) { target = view; break; }
+    if (!target) target = companions.empty() ? &greeter : companions.front().get();
+    for (auto* view : views) if (view != target) view->keyboard().clearSelection();
+    target->keyboard().navigate(dx, dy);
+  };
+  controllers.onActivate = [&] {
+    if (greeter.keyboard().activateSelected()) return true;
+    for (auto& view : companions) if (view->keyboard().activateSelected()) return true;
+    return false;
+  };
+  controllers.onCursor = [&] {
+    greeter.keyboard().clearSelection();
+    for (auto& view : companions) view->keyboard().clearSelection();
+  };
+  auto lastClock = std::chrono::steady_clock::now();
+  auto lastWidgetFrame = lastClock;
+  bool readySent = false;
+  runLoop(wayland, greeter, [&] {
+    if (finished) return false;
+    if (appearance.check()) {
+      if (!options.keyboard) widgetServices.prepare(appearance.value().lockWidgets);
+      renderContext.setTextFontFamily(appearance.value().font);
+      greeter.setWidgetAppearance(appearance.value().lockWidgets);
+      greeter.refreshAppearance();
+      for (auto& view : companions) {
+        view->setWidgetAppearance(appearance.value().lockWidgets);
+        view->refreshAppearance();
+      }
+    }
+    if (appearance.error() != appearanceError) {
+      appearanceError = appearance.error();
+      if (!appearanceError.empty()) std::cerr << "noctalia-greetd: appearance update rejected: " << appearanceError << '\n';
+    }
+    if (!options.keyboard && (!options.lock || locked)) controllers.tick();
+    if (desktopKeyboard) desktopKeyboard->commands(
+      [&](int x, int y) { greeter.keyboard().navigate(x,y); },
+      [&] { greeter.keyboard().activateSelected(); });
+    if (outputsChanged) {
+      outputsChanged = false;
+      const auto outputs = wayland.outputs();
+      auto usable = [&](wl_output* output) {
+        const auto* info = wayland.findOutputByWl(output);
+        return info && info->done && info->hasUsableGeometry();
+      };
+      std::erase_if(companions, [&](const auto& view) { return !usable(view->output()); });
+      if (!usable(greeter.output())) {
+        greeter.detach();
+        const WaylandOutput* selected = nullptr;
+        const auto preferred = envOr("LOCKSCREEN_GREETER_PRIMARY_OUTPUT");
+        for (const auto& info : outputs) {
+          if (!usable(info.output)) continue;
+          if (!selected || info.connectorName == preferred) selected = &info;
+          if (info.connectorName == preferred) break;
+        }
+        if (selected) {
+          std::erase_if(companions, [&](const auto& view) { return view->output() == selected->output; });
+          if (!greeter.initialize(*selected, sessionLock))
+            throw std::runtime_error("failed to initialize primary surface");
+        }
+      }
+      for (const auto& info : outputs) {
+        if (options.keyboard || !usable(info.output) || info.output == greeter.output()) continue;
+        if (std::any_of(companions.begin(), companions.end(), [&](const auto& view) {
+          return view->output() == info.output;
+        })) continue;
+        auto view = std::make_unique<NativeGreeter>(wayland, renderContext, textureCache, profiles,
+          envOr("LOCKSCREEN_GREETER_WALLPAPER"), sessions, parseRootCommand(), options, nullptr, widgetServices);
+        view->setWidgetAppearance(appearance.value().lockWidgets);
+        view->setAuthTarget(&greeter);
+        if (!view->initialize(info, sessionLock))
+          throw std::runtime_error("failed to initialize secondary surface");
+        companions.push_back(std::move(view));
+      }
+      greeter.refreshOutputScale();
+      for (auto& view : companions) view->refreshOutputScale();
+    }
+    greeter.setAuthenticationAllowed(!options.lock || locked);
+    if (locked && !readySent) {
+      lockHint.set(true);
+      // systemd Type=notify waits for the compositor's secure-lock acknowledgement.
+      // Merely spawning a window is never reported as a completed lock.
+      const auto path = envOr("NOTIFY_SOCKET");
+      if (!path.empty() && path.size() < sizeof(sockaddr_un::sun_path)) {
+        const int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        memcpy(address.sun_path, path.c_str(), path.size());
+        if (address.sun_path[0] == '@') address.sun_path[0] = '\0';
+        if (fd >= 0) {
+          const char message[] = "READY=1";
+          sendto(fd, message, sizeof(message) - 1, MSG_NOSIGNAL,
+            reinterpret_cast<sockaddr*>(&address), static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + (path.front() == '@' ? 0 : 1)));
+          close(fd);
+        }
+      }
+      readySent = true;
+    }
+    widgetServices.tick();
+    const auto now = std::chrono::steady_clock::now();
+    const float widgetDelta = std::chrono::duration<float, std::milli>(now-lastWidgetFrame).count();
+    if (widgetDelta >= 16.F) {
+      lastWidgetFrame = now;
+      greeter.widgetFrame(std::min(widgetDelta, 100.F));
+      for (auto& view : companions) view->widgetFrame(std::min(widgetDelta, 100.F));
+    }
+    if (now - lastClock >= std::chrono::seconds(1)) {
+      lastClock = now;
+      greeter.refresh();
+      for (auto& view : companions) view->refresh();
+    }
+    return true;
+  }, [&] {
+    bool frame = greeter.needsWidgetFrame();
+    for (const auto& view : companions) frame |= view->needsWidgetFrame();
+    int timeout = (controllers.active() || frame) ? 16 : 1000;
+    const int spectrumTimeout = widgetServices.pollTimeoutMs();
+    if (spectrumTimeout >= 0) timeout = std::min(timeout, spectrumTimeout);
+    return timeout;
+  }, desktopKeyboard ? desktopKeyboard->fd() : -1, appearance.fd(), &widgetServices);
+  widgetServices.changed = {};
+  controllers.stop();
+  if (sessionLock) {
+    if (locked && greeter.done() && !finished) {
+      ext_session_lock_v1_unlock_and_destroy(sessionLock);
+      if (wl_display_roundtrip(wayland.display()) >= 0) lockHint.set(false);
+    } else if (!locked) {
+      ext_session_lock_v1_destroy(sessionLock);
+    }
+    // Failure or process termination after locked deliberately leaves the
+    // compositor locked. Never turn a failed PAM attempt into an unlock.
+  }
+  return greeter.done() ? 0 : 1;
 }

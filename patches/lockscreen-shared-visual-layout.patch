@@ -1,8 +1,8 @@
 diff --git a/meson.build b/meson.build
 --- a/meson.build
 +++ b/meson.build
-@@ -569,6 +569,7 @@ sources = files(
-   'src/shell/launcher/launcher_panel.cpp',
+@@ -695,6 +695,7 @@ sources = files(
+   'src/shell/profile/avatar_path.cpp',
    'src/shell/greeter/greeter_appearance_sync.cpp',
    'src/shell/lockscreen/lock_screen.cpp',
 +  'src/shell/lockscreen/lock_visual_layout.cpp',
