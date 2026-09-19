@@ -8,6 +8,7 @@ noctaliaPackage.overrideAttrs (oldAttrs: {
   version = "0.2.0";
   __intentionallyOverridingVersion = true;
   mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [ "-Dtests=disabled" ];
+  doCheck = true;
 
   postPatch = ''
         ${oldAttrs.postPatch or ""}
@@ -82,6 +83,13 @@ noctaliaPackage.overrideAttrs (oldAttrs: {
     )
     test('greetd_lock_widgets_scene', greetd_lock_widgets_scene_test)
     MESON
+  '';
+
+  checkPhase = ''
+    runHook preCheck
+    meson test -C "$mesonBuildDir" --no-rebuild --print-errorlogs \
+      greetd_appearance greetd_lock_widgets_scene
+    runHook postCheck
   '';
 
   postFixup =
