@@ -115,7 +115,7 @@ int main() {
     layout.widgets = {label};
     scene.sync(layout,"DP-1",true,renderer,800,600);
     const auto* retainedGreeting = root.children().back().get();
-    for (const auto* type : {"volume", "sysmon", "audio_visualizer"}) {
+    for (const auto* type : {"volume", "sysmon", "audio_visualizer", "fancy_audio_visualizer"}) {
       auto serviceWidget = label;
       serviceWidget.id = "service"; serviceWidget.type = type;
       serviceWidget.settings.clear();

@@ -16,14 +16,14 @@ public:
   };
   explicit LockWidgetsScene(Node& root, DesktopWidgetRuntimeServices services = {},
       Callbacks callbacks = {}, AnimationManager* animations = nullptr)
-      : m_root(root), m_factory(services, DesktopWidgetFactory::MissingServicePolicy::RenderUnavailable),
+      : m_root(root), m_factory(makeFactory<DesktopWidgetFactory>(services)),
         m_services(services), m_callbacks(std::move(callbacks)), m_animations(animations) {}
   void setServices(DesktopWidgetRuntimeServices services) {
     if (services.pipewire == m_services.pipewire && services.pipewireSpectrum == m_services.pipewireSpectrum
         && services.sysmon == m_services.sysmon) return;
     clear();
     m_services = services;
-    m_factory = DesktopWidgetFactory(services, DesktopWidgetFactory::MissingServicePolicy::RenderUnavailable);
+    m_factory = makeFactory<DesktopWidgetFactory>(services);
   }
   bool needsFrameTick() const {
     for (const auto& [id, entry] : m_entries) if (entry.widget->needsFrameTick()) return true;
@@ -62,6 +62,15 @@ public:
         // also applies constructor-only options, such as sysmon's secondary series.
         if (spec.type == "calendar") settings["show_events"] = false;
         entry.widget = m_factory.create(spec.type, settings);
+        // Older supported shell cores reject service-backed widgets when a
+        // greeter service is unavailable. Keep the decoration present with a
+        // passive unavailable value instead of silently removing it.
+        if (!entry.widget && serviceUnavailable(spec.type)) {
+          auto unavailable = settings;
+          unavailable["title"] = std::string{"--"};
+          unavailable["description"] = std::string{};
+          entry.widget = m_factory.create("label", unavailable);
+        }
         if (!entry.widget) continue;
         entry.widget->setAnimationManager(m_animations);
         entry.widget->setUpdateCallback(m_callbacks.update);
@@ -116,6 +125,20 @@ public:
   }
   bool hasClock() const { return m_hasClock; }
 private:
+  template <typename Factory>
+  static Factory makeFactory(DesktopWidgetRuntimeServices services) {
+    if constexpr (requires { Factory::MissingServicePolicy::RenderUnavailable; }) {
+      return Factory(services, Factory::MissingServicePolicy::RenderUnavailable);
+    } else {
+      return Factory(services);
+    }
+  }
+  bool serviceUnavailable(std::string_view type) const {
+    return (type == "sysmon" && m_services.sysmon == nullptr)
+        || (type == "volume" && m_services.pipewire == nullptr)
+        || ((type == "audio_visualizer" || type == "fancy_audio_visualizer")
+            && m_services.pipewireSpectrum == nullptr);
+  }
   struct Entry {
     greeter_appearance::LockWidget spec;
     std::unique_ptr<DesktopWidget> widget;
