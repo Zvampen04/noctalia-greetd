@@ -87,7 +87,7 @@ noctaliaPackage.overrideAttrs (oldAttrs: {
 
   checkPhase = ''
     runHook preCheck
-    meson test -C "$mesonBuildDir" --no-rebuild --print-errorlogs \
+    meson test -C . --no-rebuild --print-errorlogs \
       greetd_appearance greetd_lock_widgets_scene
     runHook postCheck
   '';
